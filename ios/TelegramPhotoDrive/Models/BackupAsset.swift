@@ -22,6 +22,7 @@ final class BackupAsset {
     var telegramMessageId: Int?
     var telegramFileId: String?
     var uploadedAt: Date?
+    var lastAttemptAt: Date?
     var createdAt: Date
     var updatedAt: Date
 
@@ -32,6 +33,7 @@ final class BackupAsset {
         self.statusRawValue = status.rawValue
         self.byteCount = byteCount
         self.retryCount = 0
+        self.lastAttemptAt = nil
         self.createdAt = Date()
         self.updatedAt = Date()
     }

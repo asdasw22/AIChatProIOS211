@@ -16,7 +16,8 @@ final class BackupManager: ObservableObject {
     private let photos: PhotoLibraryService
     private let api: TelegramDirectAPI
     private let settings: AppSettings
-    private let maximumRetryDelaySeconds = 90
+    private let failedRetryCooldownSeconds = 10 * 60
+    private let maxRetryCount = 3
 
     private enum Keys {
         static let uploadDelaySeconds = "backupUploadDelaySeconds"
@@ -36,8 +37,9 @@ final class BackupManager: ObservableObject {
         let descriptor = FetchDescriptor<BackupAsset>(predicate: #Predicate { $0.statusRawValue == "preparing" || $0.statusRawValue == "uploading" })
         let interrupted = (try? modelContext.fetch(descriptor)) ?? []
         for asset in interrupted {
-            asset.status = .failed
-            asset.lastError = "توقفت العملية قبل اكتمال التأكيد، وسيعاد المحاولة بأمان."
+            asset.status = .pending
+            asset.lastError = "توقفت العملية قبل اكتمال التأكيد، وسيتم الانتقال للصورة التالية ثم إعادة المحاولة لاحقًا."
+            asset.lastAttemptAt = Date()
         }
         if !interrupted.isEmpty { try? modelContext.save() }
     }
@@ -98,23 +100,46 @@ final class BackupManager: ObservableObject {
         try? await Task.sleep(nanoseconds: UInt64(uploadDelaySeconds) * 1_000_000_000)
     }
 
-    private func retryDelay(for retryCount: Int) -> Int {
-        min(maximumRetryDelaySeconds, max(uploadDelaySeconds, retryCount * uploadDelaySeconds))
+    private func nextAssetForUpload() -> BackupAsset? {
+        if let pendingAsset = nextPendingAsset() {
+            return pendingAsset
+        }
+        return nextRetryableFailedAsset()
     }
 
-    private func nextAssetForUpload() -> BackupAsset? {
+    private func nextPendingAsset() -> BackupAsset? {
         var descriptor = FetchDescriptor<BackupAsset>(
-            predicate: #Predicate { $0.statusRawValue == "pending" || $0.statusRawValue == "failed" },
+            predicate: #Predicate { $0.statusRawValue == "pending" },
             sortBy: [SortDescriptor(\.creationDate, order: .forward), SortDescriptor(\.createdAt, order: .forward)]
         )
         descriptor.fetchLimit = 1
         return try? modelContext.fetch(descriptor).first
     }
 
+    private func nextRetryableFailedAsset() -> BackupAsset? {
+        let cooldownDate = Date(timeIntervalSinceNow: -TimeInterval(failedRetryCooldownSeconds))
+        var descriptor = FetchDescriptor<BackupAsset>(
+            predicate: #Predicate {
+                $0.statusRawValue == "failed" &&
+                $0.retryCount < maxRetryCount
+            },
+            sortBy: [SortDescriptor(\.lastAttemptAt, order: .forward), SortDescriptor(\.creationDate, order: .forward), SortDescriptor(\.createdAt, order: .forward)]
+        )
+        descriptor.fetchLimit = 25
+        let candidates = (try? modelContext.fetch(descriptor)) ?? []
+        return candidates.first { candidate in
+            guard let lastAttemptAt = candidate.lastAttemptAt else { return true }
+            return lastAttemptAt < cooldownDate
+        }
+    }
+
     private func upload(_ asset: BackupAsset) async {
+        guard asset.status != .uploaded else { return }
+
         do {
             asset.status = .preparing
             asset.lastError = nil
+            asset.lastAttemptAt = Date()
             try modelContext.save()
             let exported = try await photos.exportOriginal(for: asset.localIdentifier)
             defer { try? FileManager.default.removeItem(at: exported.fileURL) }
@@ -122,28 +147,38 @@ final class BackupManager: ObservableObject {
             asset.status = .uploading
             try modelContext.save()
             let response = try await api.upload(asset: asset, chatID: settings.telegramChatID, fileURL: exported.fileURL, mimeType: exported.mimeType, wifiOnly: settings.wifiOnly)
-            asset.status = .uploaded
-            asset.telegramMessageId = response.messageId
-            asset.telegramFileId = response.fileId
-            asset.uploadedAt = Date()
-            message = "تم رفع \(asset.filename)"
+            markUploaded(asset, response: response)
         } catch TelegramDirectAPIError.rateLimited(let seconds) {
-            asset.status = .failed
-            asset.retryCount += 1
-            asset.lastError = TelegramDirectAPIError.rateLimited(seconds).localizedDescription
+            markFailed(asset, errorMessage: TelegramDirectAPIError.rateLimited(seconds).localizedDescription)
             message = "Telegram أوقف الرفع مؤقتًا. سننتظر \(seconds) ثانية ثم نكمل."
             if isRunning { try? await Task.sleep(nanoseconds: UInt64(max(seconds, uploadDelaySeconds)) * 1_000_000_000) }
         } catch {
-            asset.status = .failed
-            asset.retryCount += 1
-            asset.lastError = error.localizedDescription
-            let delay = retryDelay(for: asset.retryCount)
-            message = "فشل رفع \(asset.filename): \(error.localizedDescription). انتظار \(delay) ثانية قبل المتابعة."
-            if isRunning { try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
+            markFailed(asset, errorMessage: error.localizedDescription)
+            if asset.retryCount >= maxRetryCount {
+                message = "تم تخطي \(asset.filename) مؤقتًا بعد \(maxRetryCount) محاولات، وسيكمل التطبيق مع الصور التالية."
+            } else {
+                message = "فشل رفع \(asset.filename): \(error.localizedDescription). سيتم الانتقال للصورة التالية وإعادة المحاولة لاحقًا."
+            }
         }
-        asset.updatedAt = Date()
         try? modelContext.save()
         refreshStats()
+    }
+
+    private func markUploaded(_ asset: BackupAsset, response: TelegramDirectUploadResult) {
+        asset.status = .uploaded
+        asset.telegramMessageId = response.messageId
+        asset.telegramFileId = response.fileId
+        asset.uploadedAt = Date()
+        asset.lastError = nil
+        asset.updatedAt = Date()
+        message = "تم رفع \(asset.filename)، وسيتم الانتقال للصورة التالية."
+    }
+
+    private func markFailed(_ asset: BackupAsset, errorMessage: String) {
+        asset.status = .failed
+        asset.retryCount += 1
+        asset.lastError = errorMessage
+        asset.updatedAt = Date()
     }
 
     func refreshStats() {
