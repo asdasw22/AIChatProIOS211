@@ -29,7 +29,7 @@ struct SetupView: View {
             HStack(spacing: 14) {
                 Image(systemName: "paperplane.circle.fill")
                     .font(.system(size: 46))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(AppTheme.lightGold)
                 VStack(alignment: .leading, spacing: 6) {
                     Text("إعداد Telegram")
                         .font(.title2.bold())
@@ -60,13 +60,13 @@ struct SetupView: View {
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
             Button("حفظ التوكن والإعدادات") { saveSettings() }
-                .buttonStyle(PrimaryActionButtonStyle(tint: .blue))
+                .buttonStyle(PrimaryActionButtonStyle(tint: AppTheme.gold, darkLabel: true))
                 .disabled(botToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || settings.telegramChatID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .opacity(botToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || settings.telegramChatID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.55 : 1)
 
             if settings.isConfigured {
                 Label("الإعدادات جاهزة", systemImage: "checkmark.seal.fill")
-                    .foregroundStyle(.green)
+                    .foregroundStyle(AppTheme.success)
                     .font(.subheadline.bold())
             }
         }

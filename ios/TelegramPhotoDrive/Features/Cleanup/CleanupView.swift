@@ -12,7 +12,7 @@ struct CleanupView: View {
                         HStack(spacing: 14) {
                             Image(systemName: "trash.circle.fill")
                                 .font(.system(size: 46))
-                                .foregroundStyle(.red)
+                                .foregroundStyle(AppTheme.lightGold)
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("تنظيف آمن")
                                     .font(.title2.bold())
@@ -26,6 +26,7 @@ struct CleanupView: View {
                     GlassCard {
                         Label("قبل الحذف", systemImage: "hand.raised.fill")
                             .font(.headline)
+                            .foregroundStyle(AppTheme.lightGold)
                         Text("سيطلب iOS موافقتك قبل حذف الصور. إذا كانت iCloud Photos مفعلة فقد تُحذف الصور من iCloud أيضًا.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
@@ -35,12 +36,16 @@ struct CleanupView: View {
                         } label: {
                             Label("حذف الصور المرفوعة والمؤكدة", systemImage: "trash.fill")
                         }
-                        .buttonStyle(PrimaryActionButtonStyle(tint: .red))
+                        .buttonStyle(PrimaryActionButtonStyle(tint: AppTheme.danger))
 
                         Text(manager.message)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
+
+                        Label("\(manager.stats.uploaded) صورة مؤكدة وآمنة للحذف", systemImage: "checkmark.shield.fill")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(AppTheme.success)
                     }
                 }
             }

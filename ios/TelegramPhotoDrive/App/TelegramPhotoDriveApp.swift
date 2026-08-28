@@ -25,6 +25,8 @@ struct TelegramPhotoDriveApp: App {
                 .environmentObject(settings)
                 .modelContainer(container)
                 .environment(\.layoutDirection, .rightToLeft)
+                .tint(AppTheme.gold)
+                .preferredColorScheme(.dark)
         }
     }
 }

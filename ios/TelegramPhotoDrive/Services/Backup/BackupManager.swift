@@ -17,6 +17,7 @@ final class BackupManager: ObservableObject {
     private let api: TelegramDirectAPI
     private let settings: AppSettings
     private let failedRetryCooldownSeconds = 10 * 60
+    private let pendingRetryCooldownSeconds = 60
     private let maxRetryCount = 3
 
     private enum Keys {
@@ -112,8 +113,13 @@ final class BackupManager: ObservableObject {
             predicate: #Predicate { $0.statusRawValue == "pending" },
             sortBy: [SortDescriptor(\.creationDate, order: .forward), SortDescriptor(\.createdAt, order: .forward)]
         )
-        descriptor.fetchLimit = 1
-        return try? modelContext.fetch(descriptor).first
+        descriptor.fetchLimit = 50
+        let now = Date()
+        let candidates = (try? modelContext.fetch(descriptor)) ?? []
+        return candidates.first { candidate in
+            guard let lastAttemptAt = candidate.lastAttemptAt else { return true }
+            return lastAttemptAt <= now.addingTimeInterval(-TimeInterval(pendingRetryCooldownSeconds))
+        }
     }
 
     private func nextRetryableFailedAsset() -> BackupAsset? {
@@ -136,6 +142,7 @@ final class BackupManager: ObservableObject {
     private func upload(_ asset: BackupAsset) async {
         guard asset.status != .uploaded else { return }
 
+        var telegramConfirmedUpload = false
         do {
             asset.status = .preparing
             asset.lastError = nil
@@ -147,12 +154,34 @@ final class BackupManager: ObservableObject {
             asset.status = .uploading
             try modelContext.save()
             let response = try await api.upload(asset: asset, chatID: settings.telegramChatID, fileURL: exported.fileURL, mimeType: exported.mimeType, wifiOnly: settings.wifiOnly)
+            telegramConfirmedUpload = true
             markUploaded(asset, response: response)
+            do {
+                try modelContext.save()
+            } catch {
+                // Telegram already confirmed the upload. Keep the local object
+                // marked as uploaded and never turn a persistence warning into
+                // a false network failure or a duplicate upload.
+                message = "تم تأكيد رفع \(asset.filename)، لكن تعذر حفظ الحالة محليًا: \(error.localizedDescription)"
+            }
         } catch TelegramDirectAPIError.rateLimited(let seconds) {
-            markFailed(asset, errorMessage: TelegramDirectAPIError.rateLimited(seconds).localizedDescription)
+            markRateLimited(asset, seconds: seconds)
             message = "Telegram أوقف الرفع مؤقتًا. سننتظر \(seconds) ثانية ثم نكمل."
             if isRunning { try? await Task.sleep(nanoseconds: UInt64(max(seconds, uploadDelaySeconds)) * 1_000_000_000) }
+        } catch is CancellationError {
+            guard !telegramConfirmedUpload else { return }
+            asset.status = .pending
+            asset.lastAttemptAt = Date()
+            asset.lastError = "تم إيقاف الرفع قبل اكتماله."
         } catch {
+            // Never downgrade an upload that Telegram already confirmed. This
+            // protects against a local SwiftData/UI error immediately after the
+            // network request and prevents duplicate uploads on the next run.
+            guard !telegramConfirmedUpload, asset.status != .uploaded else {
+                message = "تم تأكيد رفع \(asset.filename)، ولن تتم إعادة إرساله."
+                try? modelContext.save()
+                return
+            }
             markFailed(asset, errorMessage: error.localizedDescription)
             if asset.retryCount >= maxRetryCount {
                 message = "تم تخطي \(asset.filename) مؤقتًا بعد \(maxRetryCount) محاولات، وسيكمل التطبيق مع الصور التالية."
@@ -162,6 +191,16 @@ final class BackupManager: ObservableObject {
         }
         try? modelContext.save()
         refreshStats()
+    }
+
+    private func markRateLimited(_ asset: BackupAsset, seconds: Int) {
+        asset.status = .pending
+        // nextPendingAsset applies the normal pending cooldown as well. Offset
+        // the timestamp so the effective wait is exactly Telegram's retry_after
+        // value, not retry_after plus another full cooldown.
+        asset.lastAttemptAt = Date().addingTimeInterval(TimeInterval(max(0, seconds - pendingRetryCooldownSeconds)))
+        asset.lastError = "Telegram طلب الانتظار \(seconds) ثانية قبل المحاولة التالية."
+        asset.updatedAt = Date()
     }
 
     private func markUploaded(_ asset: BackupAsset, response: TelegramDirectUploadResult) {
@@ -190,6 +229,25 @@ final class BackupManager: ObservableObject {
             uploaded: all.filter { $0.status == .uploaded }.count,
             failed: all.filter { $0.status == .failed }.count
         )
+    }
+
+    func retryFailedAssets() {
+        let descriptor = FetchDescriptor<BackupAsset>(predicate: #Predicate { $0.statusRawValue == "failed" })
+        let failed = (try? modelContext.fetch(descriptor)) ?? []
+        guard !failed.isEmpty else {
+            message = "لا توجد صور فاشلة لإعادة المحاولة"
+            return
+        }
+
+        for asset in failed {
+            asset.status = .pending
+            asset.retryCount = 0
+            asset.lastAttemptAt = nil
+            asset.lastError = nil
+        }
+        try? modelContext.save()
+        refreshStats()
+        message = "تمت إعادة تهيئة \(failed.count) صورة لإعادة الرفع"
     }
 
     func uploadedAssets() -> [BackupAsset] {

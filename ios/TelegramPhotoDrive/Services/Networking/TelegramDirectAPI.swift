@@ -5,14 +5,14 @@ struct TelegramDirectUploadResult {
     let fileId: String?
 }
 
-private struct TelegramSendDocumentResponse: Decodable {
+struct TelegramSendDocumentResponse: Decodable {
     let ok: Bool
     let description: String?
     let result: TelegramMessage?
     let parameters: TelegramResponseParameters?
 }
 
-private struct TelegramResponseParameters: Decodable {
+struct TelegramResponseParameters: Decodable {
     let retryAfter: Int?
 
     enum CodingKeys: String, CodingKey {
@@ -20,7 +20,7 @@ private struct TelegramResponseParameters: Decodable {
     }
 }
 
-private struct TelegramMessage: Decodable {
+struct TelegramMessage: Decodable {
     let messageId: Int?
     let document: TelegramDocument?
 
@@ -30,7 +30,7 @@ private struct TelegramMessage: Decodable {
     }
 }
 
-private struct TelegramDocument: Decodable {
+struct TelegramDocument: Decodable {
     let fileId: String?
 
     enum CodingKeys: String, CodingKey {
@@ -45,6 +45,7 @@ enum TelegramDirectAPIError: LocalizedError {
     case rateLimited(Int)
     case telegram(String)
     case badStatus(Int)
+    case invalidResponse(String)
 
     var errorDescription: String? {
         switch self {
@@ -54,6 +55,7 @@ enum TelegramDirectAPIError: LocalizedError {
         case .rateLimited(let seconds): return "Telegram طلب الانتظار \(seconds) ثانية قبل المحاولة التالية."
         case .telegram(let message): return message
         case .badStatus(let status): return "فشل طلب Telegram برمز HTTP \(status)."
+        case .invalidResponse(let message): return "وصل رد غير مفهوم من Telegram: \(message)"
         }
     }
 }
@@ -90,23 +92,57 @@ final class TelegramDirectAPI {
 
         let (data, response) = try await backgroundUploader.upload(request: request, fromFile: bodyFileURL)
         guard let http = response as? HTTPURLResponse else { throw TelegramDirectAPIError.badStatus(-1) }
-        let telegram = try? decoder.decode(TelegramSendDocumentResponse.self, from: data)
+        return try Self.parseUploadResponse(data: data, statusCode: http.statusCode, decoder: decoder)
+    }
 
-        if let retryAfter = telegram?.parameters?.retryAfter {
+    static func parseUploadResponse(data: Data, statusCode: Int, decoder: JSONDecoder = JSONDecoder()) throws -> TelegramDirectUploadResult {
+        // Background URLSession may occasionally complete with a successful
+        // HTTP response while losing the response body. Telegram's API uses
+        // non-2xx codes for rejected requests, so a 2xx response without a
+        // decodable body must not turn into a duplicate upload on the next run.
+        guard !data.isEmpty else {
+            guard 200..<300 ~= statusCode else {
+                throw TelegramDirectAPIError.invalidResponse("الرد فارغ مع رمز HTTP \(statusCode)")
+            }
+            return TelegramDirectUploadResult(messageId: nil, fileId: nil)
+        }
+
+        let telegram: TelegramSendDocumentResponse
+        do {
+            telegram = try decoder.decode(TelegramSendDocumentResponse.self, from: data)
+        } catch {
+            if 200..<300 ~= statusCode {
+                return TelegramDirectUploadResult(messageId: nil, fileId: nil)
+            }
+            throw TelegramDirectAPIError.invalidResponse(responsePreview(from: data))
+        }
+
+        if let retryAfter = telegram.parameters?.retryAfter {
             throw TelegramDirectAPIError.rateLimited(retryAfter)
         }
 
-        guard 200..<300 ~= http.statusCode else {
-            if let description = telegram?.description, !description.isEmpty {
+        guard 200..<300 ~= statusCode else {
+            if let description = telegram.description, !description.isEmpty {
                 throw TelegramDirectAPIError.telegram(description)
             }
-            throw TelegramDirectAPIError.badStatus(http.statusCode)
+            throw TelegramDirectAPIError.badStatus(statusCode)
         }
 
-        guard let telegramResponse = telegram, telegramResponse.ok else {
-            throw TelegramDirectAPIError.telegram(telegram?.description ?? "Telegram رفض رفع الملف.")
+        guard telegram.ok else {
+            throw TelegramDirectAPIError.telegram(telegram.description ?? "Telegram رفض رفع الملف.")
         }
-        return TelegramDirectUploadResult(messageId: telegramResponse.result?.messageId, fileId: telegramResponse.result?.document?.fileId)
+
+        // Telegram's result/document metadata is optional for our purposes.
+        // A confirmed ok=true response is the source of truth for success.
+        return TelegramDirectUploadResult(messageId: telegram.result?.messageId, fileId: telegram.result?.document?.fileId)
+    }
+
+    private static func responsePreview(from data: Data) -> String {
+        guard let body = String(data: data, encoding: .utf8), !body.isEmpty else {
+            return "الرد فارغ"
+        }
+        let compact = body.replacingOccurrences(of: "\n", with: " ")
+        return String(compact.prefix(180))
     }
 
     private func multipartBodyFile(boundary: String, asset: BackupAsset, chatID: String, fileURL: URL, mimeType: String) throws -> URL {

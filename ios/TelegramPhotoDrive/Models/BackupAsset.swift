@@ -54,4 +54,13 @@ struct BackupStats {
     var uploading: Int
     var uploaded: Int
     var failed: Int
+
+    var completed: Int { uploaded }
+
+    var remaining: Int { max(total - uploaded, 0) }
+
+    var progress: Double {
+        guard total > 0 else { return 0 }
+        return Double(uploaded) / Double(total)
+    }
 }
