@@ -1,0 +1,18 @@
+# macOS / Xcode
+.DS_Store
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+*.ipa
+*.dSYM*
+
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Node / logs
+node_modules/
+coverage/
+npm-debug.log*
+*.log
